@@ -1,0 +1,730 @@
+#!/usr/bin/env bash
+# pve-openwrt-edge - safely place an OpenWrt LXC at the WAN edge of a Proxmox host.
+# Supported topology: one physical WAN NIC passed to OpenWrt with type=phys,
+# and Proxmox managed over an internal LAN bridge.
+set -uo pipefail
+
+PROGRAM=${0##*/}
+SELF=$(readlink -f "$0")
+DEFAULT_CONFIG=/etc/pve-openwrt-edge/edge.conf
+STATE_ROOT=/var/lib/pve-openwrt-edge
+ACTIVE_MODE=
+ACTIVE_RUN_DIR=
+RESTORE_DONE=0
+
+die() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+note() { printf '%s %s\n' "$(date -Is)" "$*"; }
+usage() {
+    cat <<'EOF'
+Usage:
+  pve-openwrt-edge bootstrap --template ROOTFS [--config FILE] [--dry-run]
+  pve-openwrt-edge doctor  [--config FILE]
+  pve-openwrt-edge status  [--config FILE]
+  pve-openwrt-edge report  [--run RUN_ID|--last]
+  pve-openwrt-edge test    [--config FILE] [--rollback-after SECONDS]
+  pve-openwrt-edge apply   [--config FILE] [--rollback-after SECONDS]
+  pve-openwrt-edge cancel  --run RUN_ID
+  pve-openwrt-edge rollback [--config FILE] [--run RUN_ID]
+
+bootstrap creates a new unprivileged OpenWrt CT with only its LAN veth; it never
+touches the physical WAN. test always restores the source topology. apply keeps
+the target only after all target checks pass. Both arm an independent emergency
+rollback before changing the network. Keep the VPS provider console available.
+EOF
+}
+
+COMMAND=${1:-}
+[[ -n "$COMMAND" ]] || { usage; exit 2; }
+shift || true
+CONFIG=$DEFAULT_CONFIG
+RUN_ID=
+ROLLBACK_AFTER=
+TEMPLATE_ARGUMENT=
+DRY_RUN=0
+REPORT_LAST=0
+while (($#)); do
+    case "$1" in
+        --config) CONFIG=${2:?missing path after --config}; shift 2 ;;
+        --run) RUN_ID=${2:?missing id after --run}; shift 2 ;;
+        --rollback-after) ROLLBACK_AFTER=${2:?missing seconds}; shift 2 ;;
+        --template) TEMPLATE_ARGUMENT=${2:?missing value after --template}; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --last) REPORT_LAST=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+load_config() {
+    local file=$1
+    [[ -r "$file" ]] || die "configuration is not readable: $file"
+    # The config is root-owned shell assignments, intentionally allowing DNS_SERVERS=(...).
+    # Never use a config supplied by an untrusted user.
+    # shellcheck disable=SC1090
+    source "$file"
+    : "${CTID:?CTID is required}"
+    : "${WAN_PHYS:?WAN_PHYS is required}"
+    : "${LAN_BRIDGE:?LAN_BRIDGE is required}"
+    : "${LAN_HOST_CIDR:?LAN_HOST_CIDR is required}"
+    : "${LAN_ROUTER_IP:?LAN_ROUTER_IP is required}"
+    : "${PUBLIC_CIDR:?PUBLIC_CIDR is required}"
+    : "${PUBLIC_GATEWAY:?PUBLIC_GATEWAY is required}"
+    : "${WAN_DEVICE:=wan}"
+    : "${LAN_DEVICE:=lan}"
+    : "${WAN_LXC_INDEX:=0}"
+    : "${LAN_LXC_INDEX:=1}"
+    : "${TARGET_HOST_INTERFACES:?TARGET_HOST_INTERFACES is required}"
+    : "${EXPECT_WG_INTERFACE:=}"
+    : "${BOOTSTRAP_HOSTNAME:=openwrt}"
+    : "${BOOTSTRAP_STORAGE:=local-lvm}"
+    : "${BOOTSTRAP_DISK_SIZE:=2}"
+    : "${BOOTSTRAP_CORES:=1}"
+    : "${BOOTSTRAP_MEMORY:=256}"
+    : "${BOOTSTRAP_SWAP:=512}"
+    : "${BOOTSTRAP_STARTUP:=order=1,up=30,down=60}"
+    : "${ROLLBACK_TIMEOUT:=120}"
+    : "${OBSERVATION_SECONDS:=25}"
+    : "${OBSERVATION_INTERVAL:=5}"
+    if ! declare -p DNS_SERVERS >/dev/null 2>&1; then
+        DNS_SERVERS=(1.1.1.1 9.9.9.9)
+    fi
+    NODE=${NODE:-$(hostname -s)}
+    CTCONF=/etc/pve/nodes/$NODE/lxc/$CTID.conf
+    PUBLIC_IP=${PUBLIC_CIDR%/*}
+    PUBLIC_PREFIX=${PUBLIC_CIDR#*/}
+    LAN_HOST_IP=${LAN_HOST_CIDR%/*}
+    LAN_PREFIX=${LAN_HOST_CIDR#*/}
+}
+
+require_root() { [[ $EUID -eq 0 ]] || die 'must run as root'; }
+require_commands() {
+    local missing=0 cmd
+    for cmd in pct pvesm lxc-info nsenter systemctl systemd-run ifreload ip ss ping curl getent awk sed grep flock sysctl readlink cmp mkdir mv dirname tee date sleep cat; do
+        command -v "$cmd" >/dev/null 2>&1 || { printf 'missing command: %s\n' "$cmd" >&2; missing=1; }
+    done
+    ((missing == 0)) || die 'required commands are missing'
+}
+
+valid_id() { [[ $1 =~ ^[A-Za-z0-9T._-]+$ ]]; }
+run_dir() { printf '%s/runs/%s\n' "$STATE_ROOT" "$1"; }
+unit_name() { printf 'pve-openwrt-edge-rollback-%s\n' "$1"; }
+state_file() { printf '%s/state\n' "$1"; }
+
+set_state() {
+    local dir=$1 state=$2 tmp
+    tmp="$dir/.state.$$"
+    printf '%s\n' "$state" > "$tmp" && mv -f "$tmp" "$(state_file "$dir")"
+    note "STATE: $state"
+}
+
+get_state() {
+    local dir=$1
+    [[ -r "$(state_file "$dir")" ]] && <"$(state_file "$dir")" || printf 'UNKNOWN\n'
+}
+
+netmask_for_prefix() {
+    local p=$1 i rem octet out=''
+    [[ $p =~ ^[0-9]+$ ]] && ((p >= 0 && p <= 32)) || return 1
+    for i in 0 1 2 3; do
+        rem=$((p - i * 8))
+        if ((rem >= 8)); then octet=255
+        elif ((rem <= 0)); then octet=0
+        else octet=$((256 - 2 ** (8 - rem)))
+        fi
+        out+=${out:+.}$octet
+    done
+    printf '%s\n' "$out"
+}
+
+ipv4_to_int() {
+    local ip=$1 a b c d
+    IFS=. read -r a b c d <<<"$ip"
+    [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ && $c =~ ^[0-9]+$ && $d =~ ^[0-9]+$ ]] || return 1
+    ((a <= 255 && b <= 255 && c <= 255 && d <= 255)) || return 1
+    printf '%u\n' "$((a * 16777216 + b * 65536 + c * 256 + d))"
+}
+
+cidrs_overlap() {
+    local a=${1%/*} ap=${1#*/} b=${2%/*} bp=${2#*/} ai bi am bm as bs ae be
+    ai=$(ipv4_to_int "$a") && bi=$(ipv4_to_int "$b") || return 1
+    [[ $ap =~ ^[0-9]+$ && $bp =~ ^[0-9]+$ ]] && ((ap >= 0 && ap <= 32 && bp >= 0 && bp <= 32)) || return 1
+    am=$(( (0xffffffff << (32 - ap)) & 0xffffffff )); bm=$(( (0xffffffff << (32 - bp)) & 0xffffffff ))
+    as=$((ai & am)); bs=$((bi & bm))
+    ae=$(( as + (0xffffffff - am) )); be=$(( bs + (0xffffffff - bm) ))
+    (( as <= be && bs <= ae ))
+}
+
+log_setup() {
+    LOG=$1
+    touch "$LOG"; chmod 600 "$LOG"
+    exec > >(tee -a "$LOG") 2>&1
+}
+
+wait_for_pct() {
+    local i
+    for i in $(seq 1 30); do
+        pct exec "$CTID" -- true >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
+}
+
+record() {
+    local label=$1; shift
+    note "CHECK: $label"
+    if "$@"; then
+        note "PASS: $label"
+        [[ -n ${RUN_DIR:-} ]] && printf '%s\tPASS\t%s\n' "${CHECK_PHASE:-GENERAL}" "$label" >> "$RUN_DIR/checks.tsv"
+        return 0
+    fi
+    note "FAIL: $label"
+    [[ -n ${RUN_DIR:-} ]] && printf '%s\tFAIL\t%s\n' "${CHECK_PHASE:-GENERAL}" "$label" >> "$RUN_DIR/checks.tsv"
+    return 1
+}
+
+record_warn() {
+    local label=$1; shift
+    note "WARN: $label"
+    "$@" || true
+    [[ -n ${RUN_DIR:-} ]] && printf '%s\tWARN\t%s\n' "${CHECK_PHASE:-GENERAL}" "$label" >> "$RUN_DIR/checks.tsv"
+}
+
+record_skipped() {
+    local label=$1 reason=$2
+    note "SKIPPED: $label ($reason)"
+    [[ -n ${RUN_DIR:-} ]] && printf '%s\tSKIPPED\t%s: %s\n' "${CHECK_PHASE:-GENERAL}" "$label" "$reason" >> "$RUN_DIR/checks.tsv"
+}
+
+capture() {
+    local file=$1; shift
+    mkdir -p "$(dirname "$file")"
+    "$@" >"$file" 2>&1 || true
+    chmod 600 "$file"
+}
+
+collect_state() {
+    local phase=$1
+    local destination=
+    [[ -n ${RUN_DIR:-} ]] && destination="$RUN_DIR/${phase,,}"
+    note "STATE-$phase: host addresses and routes"
+    ip -details -br addr || true; ip route || true; ip neigh show || true
+    if [[ -n "$destination" ]]; then
+        capture "$destination/ip-address.txt" ip -details addr
+        capture "$destination/ip-route.txt" ip route
+        capture "$destination/ip-rule.txt" ip rule
+        capture "$destination/bridge.txt" bridge link
+        capture "$destination/firewall.txt" sh -c 'nft list ruleset 2>/dev/null || iptables-save 2>/dev/null || true'
+        capture "$destination/interfaces.txt" ip -details link
+    fi
+    note "STATE-$phase: CT configuration"
+    pct status "$CTID" || true; pct config "$CTID" || true
+    [[ -n "$destination" ]] && capture "$destination/ct-config.txt" pct config "$CTID"
+    if pct exec "$CTID" -- true >/dev/null 2>&1; then
+        note "STATE-$phase: OpenWrt network"
+        pct exec "$CTID" -- sh -c 'ip -details -br link; ip -br addr; ip route; ip neigh show' || true
+        pct exec "$CTID" -- sh -c "uci show network 2>&1 | sed -E \"s/(private_key|preshared_key)=.*/\\1='[REDACTED]'/\"" || true
+        pct exec "$CTID" -- wg show || true
+        if [[ -n "$destination" ]]; then
+            capture "$destination/openwrt-ip-address.txt" pct exec "$CTID" -- ip -details addr
+            capture "$destination/openwrt-ip-route.txt" pct exec "$CTID" -- ip route
+            capture "$destination/openwrt-ip-rule.txt" pct exec "$CTID" -- ip rule
+            capture "$destination/openwrt-network.txt" pct exec "$CTID" -- sh -c "uci show network 2>&1 | sed -E \"s/(private_key|preshared_key)=.*/\\1='[REDACTED]'/\""
+            capture "$destination/openwrt-firewall.txt" pct exec "$CTID" -- sh -c "uci show firewall 2>&1; nft list ruleset 2>/dev/null || iptables-save 2>/dev/null || true"
+        fi
+    fi
+}
+
+source_preflight() {
+    local failed=0
+    CHECK_PHASE=SOURCE
+    record 'CT is running' sh -c "pct status '$CTID' | grep -q running" || failed=1
+    record 'physical WAN exists on Proxmox' test -e "/sys/class/net/$WAN_PHYS" || failed=1
+    record 'Proxmox owns configured public address' sh -c "ip -4 addr show dev '$WAN_PHYS' | grep -q 'inet $PUBLIC_CIDR'" || failed=1
+    record 'Proxmox has configured provider default route' sh -c "ip route | grep -q '^default via $PUBLIC_GATEWAY dev $WAN_PHYS'" || failed=1
+    record 'target host interfaces template exists' test -r "$TARGET_HOST_INTERFACES" || failed=1
+    record 'CT config exists' test -r "$CTCONF" || failed=1
+    record 'OpenWrt config accepts writes' pct exec "$CTID" -- test -w /etc/config/network || failed=1
+    ((failed == 0))
+}
+
+target_preflight() {
+    local failed=0
+    CHECK_PHASE=TARGET
+    record 'OpenWrt container is running' sh -c "pct status '$CTID' | grep -q running" || failed=1
+    record 'physical WAN is absent from Proxmox' test ! -e "/sys/class/net/$WAN_PHYS" || failed=1
+    record 'CT has physical WAN passthrough' sh -c "pct config '$CTID' | grep -q '^lxc.net.$WAN_LXC_INDEX.type: phys$' && pct config '$CTID' | grep -q '^lxc.net.$WAN_LXC_INDEX.link: $WAN_PHYS$' && pct config '$CTID' | grep -q '^lxc.net.$WAN_LXC_INDEX.name: $WAN_DEVICE$'" || failed=1
+    record 'Proxmox default route uses OpenWrt LAN' sh -c "ip route | grep -q '^default via $LAN_ROUTER_IP dev $LAN_BRIDGE'" || failed=1
+    record 'Proxmox LAN bridge has expected address' sh -c "ip -4 addr show dev '$LAN_BRIDGE' | grep -q 'inet $LAN_HOST_CIDR'" || failed=1
+    record 'Proxmox reaches OpenWrt LAN gateway' ping -c 2 -W 3 "$LAN_ROUTER_IP" || failed=1
+    record 'OpenWrt expected LAN device is mapped' sh -c "pct config '$CTID' | grep -q '^net$LAN_LXC_INDEX: name=$LAN_DEVICE,bridge=$LAN_BRIDGE,'" || failed=1
+    record 'OpenWrt WAN has public address' pct exec "$CTID" -- sh -c "ip -4 addr show dev '$WAN_DEVICE' | grep -q 'inet $PUBLIC_CIDR'" || failed=1
+    record 'OpenWrt has provider default route' pct exec "$CTID" -- sh -c "ip route | grep -q '^default via $PUBLIC_GATEWAY dev $WAN_DEVICE'" || failed=1
+    record 'OpenWrt reaches provider gateway' pct exec "$CTID" -- ping -c 2 -W 3 "$PUBLIC_GATEWAY" || failed=1
+    record 'OpenWrt reaches Internet' pct exec "$CTID" -- ping -c 2 -W 3 1.1.1.1 || failed=1
+    record 'OpenWrt resolves DNS' pct exec "$CTID" -- nslookup download.proxmox.com || failed=1
+    record 'OpenWrt LAN address is present' pct exec "$CTID" -- sh -c "ip -4 addr show dev '$LAN_DEVICE' | grep -q 'inet $LAN_ROUTER_IP/$LAN_PREFIX'" || failed=1
+    record 'OpenWrt WAN firewall zone is defined' pct exec "$CTID" -- sh -c "uci show firewall | grep -q \"\\.name='wan'\"" || failed=1
+    record 'OpenWrt WAN masquerading is configured' pct exec "$CTID" -- sh -c "uci show firewall | grep -q \"\\.masq='1'\"" || failed=1
+    record 'OpenWrt LAN to WAN forwarding is configured' pct exec "$CTID" -- sh -c "uci show firewall | grep -q \"\\.src='lan'\" && uci show firewall | grep -q \"\\.dest='wan'\"" || failed=1
+    record 'Proxmox reaches Internet through OpenWrt' ping -c 2 -W 3 1.1.1.1 || failed=1
+    record 'Proxmox resolves DNS through OpenWrt' getent hosts download.proxmox.com || failed=1
+    record 'SSH listener is present' sh -c "ss -ltn | grep -q ':22 '" || failed=1
+    record 'Proxmox HTTPS works on LAN address' curl -kfsS --connect-timeout 3 -o /dev/null "https://$LAN_HOST_IP:8006/" || failed=1
+    record 'Proxmox port 8006 listener is present' sh -c "ss -ltn | grep -q ':8006 '" || failed=1
+    if [[ -n "$EXPECT_WG_INTERFACE" ]]; then
+        record "Proxmox WireGuard interface $EXPECT_WG_INTERFACE exists" ip link show "$EXPECT_WG_INTERFACE" || failed=1
+    fi
+    ((failed == 0))
+}
+
+backup_snapshot() {
+    local dir=$1
+    mkdir -p "$dir/source" "$dir/target" "$dir/restored"; chmod 700 "$dir" "$dir/source" "$dir/target" "$dir/restored"
+    cp -a /etc/network/interfaces "$dir/source/interfaces"
+    cp -a "$CTCONF" "$dir/source/ct.conf"
+    pct pull "$CTID" /etc/config/network "$dir/source/openwrt-network"
+    capture "$dir/source/ip-address.txt" ip -details addr
+    capture "$dir/source/ip-route.txt" ip route
+    capture "$dir/source/ip-rule.txt" ip rule
+    capture "$dir/source/bridge.txt" bridge link
+    capture "$dir/source/firewall.txt" sh -c 'nft list ruleset 2>/dev/null || iptables-save 2>/dev/null || true'
+    sysctl -n net.ipv4.ip_forward > "$dir/source/ip-forward"
+    pct status "$CTID" | awk '{print $2}' > "$dir/source/ct-initial-state"
+    cp -a "$CONFIG" "$dir/config.conf"
+    for f in source/interfaces source/ct.conf source/openwrt-network source/ip-forward source/ct-initial-state config.conf; do
+        [[ -s "$dir/$f" ]] || die "backup failed: $dir/$f is empty or missing"
+    done
+    touch "$dir/checks.tsv" "$dir/events.log"
+    chmod 600 "$dir/config.conf" "$dir/checks.tsv" "$dir/events.log" "$dir/source"/*
+}
+
+render_target_ct_config() {
+    local source=$1 destination=$2 idx=$WAN_LXC_INDEX
+    awk -v idx="$idx" -v nic="$WAN_PHYS" -v dev="$WAN_DEVICE" '
+        $0 ~ ("^net" idx ":") { next }
+        $0 ~ ("^lxc\\.net\\." idx "\\.") { next }
+        { print }
+        END {
+          print "lxc.net." idx ".type: phys"
+          print "lxc.net." idx ".link: " nic
+          print "lxc.net." idx ".name: " dev
+          print "lxc.net." idx ".flags: up"
+        }
+    ' "$source" > "$destination"
+    chmod 600 "$destination"
+}
+
+configure_openwrt_target() {
+    local mask; mask=$(netmask_for_prefix "$PUBLIC_PREFIX") || die 'invalid public CIDR prefix'
+    pct exec "$CTID" -- uci revert network || true
+    pct exec "$CTID" -- uci set network.wan=interface || return 1
+    pct exec "$CTID" -- uci set network.wan.device="$WAN_DEVICE" || return 1
+    pct exec "$CTID" -- uci set network.wan.proto=static || return 1
+    pct exec "$CTID" -- uci set network.wan.ipaddr="$PUBLIC_IP" || return 1
+    pct exec "$CTID" -- uci set network.wan.netmask="$mask" || return 1
+    pct exec "$CTID" -- uci set network.wan.gateway="$PUBLIC_GATEWAY" || return 1
+    pct exec "$CTID" -- uci -q delete network.wan.dns || true
+    local dns
+    for dns in "${DNS_SERVERS[@]}"; do pct exec "$CTID" -- uci add_list network.wan.dns="$dns" || return 1; done
+    pct exec "$CTID" -- uci set network.lan=interface || return 1
+    pct exec "$CTID" -- uci set network.lan.device="$LAN_DEVICE" || return 1
+    pct exec "$CTID" -- uci set network.lan.proto=static || return 1
+    pct exec "$CTID" -- uci set network.lan.ipaddr="$LAN_ROUTER_IP" || return 1
+    pct exec "$CTID" -- uci set network.lan.netmask="$(netmask_for_prefix "$LAN_PREFIX")" || return 1
+    pct exec "$CTID" -- uci commit network || return 1
+    pct exec "$CTID" -- /etc/init.d/network restart || true
+    pct exec "$CTID" -- ifup wan || return 1
+    pct exec "$CTID" -- ifup lan || return 1
+}
+
+transition_to_target() {
+    local dir=$1
+    render_target_ct_config "$dir/source/ct.conf" "$dir/target/ct.target.conf"
+    note 'STEP: stopping OpenWrt so Proxmox returns the physical WAN'
+    pct stop "$CTID" --skiplock 1 || return 1
+    note 'STEP: installing OpenWrt physical-WAN configuration'
+    cp -f "$dir/target/ct.target.conf" "$CTCONF" || return 1
+    note 'STEP: moving Proxmox to the LAN-only interface configuration'
+    cp -f "$TARGET_HOST_INTERFACES" /etc/network/interfaces || return 1
+    ifreload -a || return 1
+    note 'STEP: starting OpenWrt with the physical WAN'
+    pct start "$CTID" || return 1
+    wait_for_pct || return 1
+    note 'STEP: applying OpenWrt WAN and LAN UCI configuration'
+    configure_openwrt_target
+}
+
+emergency_restore() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    if [[ $RESTORE_DONE -eq 0 && -d "$ACTIVE_RUN_DIR" ]]; then
+        note "EMERGENCY: foreground worker exited with status $rc; restoring source topology"
+        restore_snapshot "$ACTIVE_RUN_DIR" || true
+        cancel_rollback "${ACTIVE_RUN_DIR##*/}" || true
+    fi
+    exit "$rc"
+}
+
+restore_snapshot() {
+    local dir=$1
+    [[ -r "$dir/config.conf" ]] || die "snapshot is incomplete: $dir"
+    # shellcheck disable=SC1090
+    source "$dir/config.conf"
+    load_config "$dir/config.conf"
+    local lock current
+    lock="$dir/restore.lock"
+    exec 8>"$lock"
+    flock 8
+    current=$(get_state "$dir")
+    if [[ "$current" == RESTORED || "$current" == CONFIRMED ]]; then
+        note "RESTORE: skipped; run is already $current"
+        return 0
+    fi
+    set_state "$dir" RESTORING
+    note "RESTORE: returning to source snapshot $dir"
+    pct stop "$CTID" --skiplock 1 >/dev/null 2>&1 || true
+    local i returned=0
+    for i in $(seq 1 30); do
+        [[ -e "/sys/class/net/$WAN_PHYS" ]] && { returned=1; break; }
+        sleep 1
+    done
+    if ((returned != 1)); then set_state "$dir" FAILED; return 1; fi
+    cp -f "$dir/source/ct.conf" "$CTCONF" || { set_state "$dir" FAILED; return 1; }
+    cp -f "$dir/source/interfaces" /etc/network/interfaces || { set_state "$dir" FAILED; return 1; }
+    ifreload -a || { set_state "$dir" FAILED; return 1; }
+    sysctl -w "net.ipv4.ip_forward=$(<"$dir/source/ip-forward")" >/dev/null || { set_state "$dir" FAILED; return 1; }
+    if grep -qx running "$dir/source/ct-initial-state"; then
+        pct start "$CTID" || { set_state "$dir" FAILED; return 1; }
+        wait_for_pct || { set_state "$dir" FAILED; return 1; }
+        pct push "$CTID" "$dir/source/openwrt-network" /etc/config/network --perms 0644 || { set_state "$dir" FAILED; return 1; }
+        pct exec "$CTID" -- uci revert network || true
+        pct exec "$CTID" -- /etc/init.d/network restart || true
+        pct exec "$CTID" -- ifup wan || { set_state "$dir" FAILED; return 1; }
+        pct exec "$CTID" -- ifup lan || { set_state "$dir" FAILED; return 1; }
+    fi
+    CHECK_PHASE=ROLLBACK
+    collect_state RESTORED
+    local failed=0
+    record 'source interfaces restored exactly' cmp -s /etc/network/interfaces "$dir/source/interfaces" || failed=1
+    record 'source CT config restored exactly' cmp -s "$CTCONF" "$dir/source/ct.conf" || failed=1
+    pct pull "$CTID" /etc/config/network "$dir/restored/openwrt-network" || { set_state "$dir" FAILED; return 1; }
+    record 'source OpenWrt network restored exactly' cmp -s "$dir/restored/openwrt-network" "$dir/source/openwrt-network" || failed=1
+    record 'host public address restored' sh -c "ip -4 addr show dev '$WAN_PHYS' | grep -q 'inet $PUBLIC_CIDR'" || failed=1
+    record 'host provider default route restored' sh -c "ip route | grep -q '^default via $PUBLIC_GATEWAY dev $WAN_PHYS'" || failed=1
+    record 'provider gateway reachable after restore' ping -c 2 -W 3 "$PUBLIC_GATEWAY" || failed=1
+    record 'host Internet reachable after restore' ping -c 2 -W 3 1.1.1.1 || failed=1
+    record 'host DNS works after restore' getent hosts download.proxmox.com || failed=1
+    record 'SSH listener present after restore' sh -c "ss -ltn | grep -q ':22 '" || failed=1
+    record 'Proxmox port 8006 listener present after restore' sh -c "ss -ltn | grep -q ':8006 '" || failed=1
+    if ((failed == 0)); then set_state "$dir" RESTORED; note 'RESTORE: completed and verified'; return 0; fi
+    set_state "$dir" FAILED
+    return 1
+}
+
+arm_rollback() {
+    local id=$1 seconds=$2 unit; unit=$(unit_name "$id")
+    [[ $seconds =~ ^[0-9]+$ ]] && ((seconds >= 15)) || die '--rollback-after must be at least 15 seconds'
+    systemd-run --quiet --unit="$unit" --on-active="${seconds}s" "$SELF" internal-restore --run "$id"
+    note "FAILSAFE: rollback is armed for ${seconds}s (unit $unit.timer)"
+}
+
+cancel_rollback() {
+    local id=$1 unit; unit=$(unit_name "$id")
+    systemctl stop "$unit.timer" "$unit.service" >/dev/null 2>&1 || true
+    note "ROLLBACK TIMER CANCELLED: $id"
+}
+
+new_run() {
+    local mode=$1 id dir
+    id="$(date -u +%Y%m%dT%H%M%SZ)-$mode"
+    dir=$(run_dir "$id")
+    mkdir -p "$STATE_ROOT/runs"; chmod 700 "$STATE_ROOT" "$STATE_ROOT/runs"
+    printf '%s\n' "$id"
+}
+
+write_report() {
+    local dir=$1 mode=$2 target=${3:-UNKNOWN} recovery=${4:-NOT-RUN}
+    {
+        printf '%s RESULT: %s\n\n' "${mode^^}" "$target"
+        printf 'SOURCE SNAPSHOT: PASS\n\n'
+        printf 'TARGET CHECKS\n'
+        awk -F '\t' '$1 == "TARGET" { printf "  %-7s %s\n", $2, $3 }' "$dir/checks.tsv" 2>/dev/null || true
+        printf '\nSOURCE RECOVERY: %s\n' "$recovery"
+        awk -F '\t' '$1 == "ROLLBACK" { printf "  %-7s %s\n", $2, $3 }' "$dir/checks.tsv" 2>/dev/null || true
+        printf '\nFINAL STATE: %s\n' "$(get_state "$dir")"
+        printf 'LAST CHECKPOINT: %s\n' "$(<"$dir/checkpoint" 2>/dev/null || printf unknown)"
+        printf 'EVENT LOG: %s/events.log\n' "$dir"
+    } > "$dir/report.txt"
+    chmod 600 "$dir/report.txt"
+}
+
+set_checkpoint() { printf '%s\n' "$2" > "$1/checkpoint"; chmod 600 "$1/checkpoint"; note "CHECKPOINT: $2"; }
+
+observe_target() {
+    local elapsed=0
+    ((OBSERVATION_SECONDS > 0)) || return 0
+    note "OBSERVATION: holding target topology for ${OBSERVATION_SECONDS}s"
+    while ((elapsed < OBSERVATION_SECONDS)); do
+        sleep "$OBSERVATION_INTERVAL"
+        elapsed=$((elapsed + OBSERVATION_INTERVAL))
+        CHECK_PHASE=TARGET
+        record "observation ${elapsed}s: OpenWrt gateway reachability" pct exec "$CTID" -- ping -c 1 -W 3 "$PUBLIC_GATEWAY" || return 1
+        record "observation ${elapsed}s: OpenWrt Internet reachability" pct exec "$CTID" -- ping -c 1 -W 3 1.1.1.1 || return 1
+        record "observation ${elapsed}s: Proxmox Internet reachability" ping -c 1 -W 3 1.1.1.1 || return 1
+    done
+}
+
+show_command() {
+    printf 'DRY-RUN:'
+    printf ' %q' "$@"
+    printf '\n'
+}
+
+bootstrap_preflight() {
+    local template=$1 failed=0
+    if pct config "$CTID" >/dev/null 2>&1; then
+        note "FAIL: CT $CTID already exists; bootstrap only creates a new container"
+        failed=1
+    fi
+    if ! ip link show dev "$LAN_BRIDGE" >/dev/null 2>&1; then
+        note "FAIL: LAN bridge does not exist: $LAN_BRIDGE"
+        failed=1
+    fi
+    if [[ -f "$template" ]]; then
+        :
+    elif ! pvesm path "$template" >/dev/null 2>&1; then
+        note "FAIL: OpenWrt rootfs template is not available: $template"
+        failed=1
+    fi
+    ((failed == 0))
+}
+
+configure_openwrt_bootstrap() {
+    local lan_mask pool dhcp_start dhcp_limit
+    lan_mask=$(netmask_for_prefix "$LAN_PREFIX") || die 'invalid LAN CIDR prefix'
+    pool=$(dhcp_pool) || die 'LAN subnet is too small for a DHCP pool'
+    read -r dhcp_start dhcp_limit <<<"$pool"
+    pct exec "$CTID" -- uci set network.lan=interface || return 1
+    pct exec "$CTID" -- uci set network.lan.device="$LAN_DEVICE" || return 1
+    pct exec "$CTID" -- uci set network.lan.proto=static || return 1
+    pct exec "$CTID" -- uci set network.lan.ipaddr="$LAN_ROUTER_IP" || return 1
+    pct exec "$CTID" -- uci set network.lan.netmask="$lan_mask" || return 1
+    pct exec "$CTID" -- uci commit network || return 1
+    pct exec "$CTID" -- uci set dhcp.lan=dhcp || return 1
+    pct exec "$CTID" -- uci set dhcp.lan.interface=lan || return 1
+    pct exec "$CTID" -- uci set dhcp.lan.start="$dhcp_start" || return 1
+    pct exec "$CTID" -- uci set dhcp.lan.limit="$dhcp_limit" || return 1
+    pct exec "$CTID" -- uci set dhcp.lan.leasetime=12h || return 1
+    pct exec "$CTID" -- uci commit dhcp || return 1
+    pct exec "$CTID" -- /etc/init.d/network restart || true
+    pct exec "$CTID" -- ifup lan || true
+    pct exec "$CTID" -- /etc/init.d/dnsmasq enable || true
+    pct exec "$CTID" -- /etc/init.d/dnsmasq restart || true
+}
+
+dhcp_pool() {
+    local router base mask usable_last candidate limit
+    ((LAN_PREFIX <= 29)) || return 1
+    router=$(ipv4_to_int "$LAN_ROUTER_IP") || return 1
+    mask=$(( (0xffffffff << (32 - LAN_PREFIX)) & 0xffffffff ))
+    base=$((router & mask)); usable_last=$((base + (0xffffffff - mask) - 1))
+    candidate=100
+    ((base + candidate <= usable_last)) || candidate=2
+    while ((base + candidate == router && base + candidate <= usable_last)); do candidate=$((candidate + 1)); done
+    ((base + candidate <= usable_last)) || return 1
+    limit=$((usable_last - (base + candidate) + 1)); ((limit > 150)) && limit=150
+    if ((router > base + candidate && router < base + candidate + limit)); then limit=$((router - (base + candidate))); fi
+    ((limit >= 1)) || return 1
+    printf '%s %s\n' "$candidate" "$limit"
+}
+
+do_bootstrap() {
+    require_root; require_commands; load_config "$CONFIG"
+    local template=${TEMPLATE_ARGUMENT:-${BOOTSTRAP_TEMPLATE:-}} netarg
+    [[ -n "$template" ]] || die 'bootstrap requires --template ROOTFS (an absolute rootfs tarball or PVE template volume)'
+    note "BOOTSTRAP: CT=$CTID LAN=$LAN_BRIDGE/$LAN_DEVICE router=$LAN_ROUTER_IP"
+    bootstrap_preflight "$template" || die 'bootstrap preflight failed; no changes made'
+    netarg="--net${LAN_LXC_INDEX}"
+    local create_cmd=(pct create "$CTID" "$template" --ostype unmanaged --unprivileged 1 --features nesting=1 --hostname "$BOOTSTRAP_HOSTNAME" --cores "$BOOTSTRAP_CORES" --memory "$BOOTSTRAP_MEMORY" --swap "$BOOTSTRAP_SWAP" --rootfs "$BOOTSTRAP_STORAGE:$BOOTSTRAP_DISK_SIZE" --onboot 1 --startup "$BOOTSTRAP_STARTUP" "$netarg" "name=$LAN_DEVICE,bridge=$LAN_BRIDGE,type=veth" --start 1)
+    if ((DRY_RUN == 1)); then
+        show_command "${create_cmd[@]}"
+        note 'DRY-RUN: after creation, the tool will configure OpenWrt LAN and DHCP only; WAN remains untouched.'
+        return 0
+    fi
+    note 'BOOTSTRAP: creating unprivileged unmanaged OpenWrt CT with LAN veth only'
+    "${create_cmd[@]}" || die 'pct create failed; the CT was not automatically removed'
+    wait_for_pct || die 'OpenWrt did not become available through pct exec'
+    note 'BOOTSTRAP: configuring OpenWrt LAN and DHCP'
+    configure_openwrt_bootstrap || die 'OpenWrt was created but initial LAN configuration failed; use pct enter to inspect it'
+    record 'CT has configured LAN veth' sh -c "pct config '$CTID' | grep -q '^net$LAN_LXC_INDEX: name=$LAN_DEVICE,bridge=$LAN_BRIDGE,'" || die 'LAN veth verification failed'
+    record 'OpenWrt LAN address is present' pct exec "$CTID" -- sh -c "ip -4 addr show dev '$LAN_DEVICE' | grep -q 'inet $LAN_ROUTER_IP/$LAN_PREFIX'" || die 'LAN address verification failed'
+    note "BOOTSTRAP: PASS. The CT is LAN-only; run '$PROGRAM test' later from the source topology to exercise the WAN handoff."
+    note "BOOTSTRAP: set an OpenWrt root password from the Proxmox console with: pct enter $CTID"
+}
+
+do_doctor() {
+    require_root; require_commands; load_config "$CONFIG"
+    note "DOCTOR: configuration $CONFIG"
+    note "DOCTOR: CT=$CTID WAN=$WAN_PHYS public=$PUBLIC_CIDR LAN=$LAN_BRIDGE/$LAN_HOST_CIDR"
+    local failed=0
+    [[ -r "$CTCONF" ]] || { note "FAIL: CT config missing: $CTCONF"; failed=1; }
+    [[ -w /etc/pve && -w "$(dirname "$CTCONF")" ]] || { note 'FAIL: /etc/pve is not writable'; failed=1; }
+    [[ -r "$TARGET_HOST_INTERFACES" ]] || { note "FAIL: target host template missing: $TARGET_HOST_INTERFACES"; failed=1; }
+    netmask_for_prefix "$PUBLIC_PREFIX" >/dev/null || { note 'FAIL: invalid public CIDR'; failed=1; }
+    netmask_for_prefix "$LAN_PREFIX" >/dev/null || { note 'FAIL: invalid LAN CIDR'; failed=1; }
+    ipv4_to_int "$LAN_ROUTER_IP" >/dev/null || { note 'FAIL: invalid LAN router address'; failed=1; }
+    cidrs_overlap "$PUBLIC_CIDR" "$LAN_HOST_CIDR" && { note 'FAIL: public and LAN networks overlap'; failed=1; }
+    cidrs_overlap "$LAN_HOST_CIDR" "$LAN_ROUTER_IP/$LAN_PREFIX" || { note 'FAIL: Proxmox LAN address and OpenWrt LAN address are not in the same subnet'; failed=1; }
+    ((WAN_LXC_INDEX != LAN_LXC_INDEX)) || { note 'FAIL: WAN and LAN LXC indices must differ'; failed=1; }
+    pct status "$CTID" || { note 'FAIL: CT is not known to Proxmox'; failed=1; }
+    ip link show dev "$LAN_BRIDGE" >/dev/null 2>&1 || { note "FAIL: LAN bridge missing: $LAN_BRIDGE"; failed=1; }
+    mkdir -p "$STATE_ROOT/runs" && [[ -w "$STATE_ROOT/runs" ]] || { note "FAIL: state directory is not writable: $STATE_ROOT/runs"; failed=1; }
+    if ! pct exec "$CTID" -- sh -c 'command -v uci && command -v ip && command -v ping && command -v nslookup' >/dev/null 2>&1; then
+        note 'FAIL: OpenWrt is missing one or more required commands (uci, ip, ping, nslookup)'; failed=1
+    fi
+    if ! pct exec "$CTID" -- sh -c "uci show firewall | grep -q \"\\.name='wan'\"" >/dev/null 2>&1; then
+        note 'WARN: OpenWrt WAN firewall zone is not currently detectable'
+    fi
+    if [[ -e "/sys/class/net/$WAN_PHYS" ]]; then
+        note 'STATE: source topology (Proxmox owns WAN)'
+        bridge link show dev "$WAN_PHYS" 2>/dev/null | grep -q 'master ' && { note "FAIL: WAN physical interface is enslaved: $WAN_PHYS"; failed=1; }
+    else
+        note 'STATE: target topology (OpenWrt owns WAN)'
+    fi
+    if ! grep -q "iface $WAN_PHYS inet manual" "$TARGET_HOST_INTERFACES"; then note 'FAIL: target interfaces does not leave WAN physical interface manual'; failed=1; fi
+    if ! grep -q "address $LAN_HOST_CIDR" "$TARGET_HOST_INTERFACES" || ! grep -q "gateway $LAN_ROUTER_IP" "$TARGET_HOST_INTERFACES"; then note 'FAIL: target interfaces does not match configured Proxmox LAN address/gateway'; failed=1; fi
+    local probe="pve-openwrt-edge-doctor-$$"
+    if systemd-run --quiet --unit="$probe" --on-active=5m /bin/true; then systemctl stop "$probe.timer" "$probe.service" >/dev/null 2>&1 || true; else note 'FAIL: cannot create a transient systemd rollback timer'; failed=1; fi
+    ((failed == 0)) || return 1
+    note 'DOCTOR: PASS'
+}
+
+do_status() {
+    require_root; load_config "$CONFIG"
+    note "STATUS: CT=$CTID public=$PUBLIC_CIDR"
+    collect_state CURRENT
+    if [[ -e "/sys/class/net/$WAN_PHYS" ]]; then
+        note 'STATUS: source topology detected; Proxmox currently owns the physical WAN'
+    else
+        note 'STATUS: target topology detected; OpenWrt currently owns the physical WAN'
+        target_preflight || true
+    fi
+    if [[ -r "$STATE_ROOT/latest-run" ]]; then
+        note "STATUS: latest run report: $(run_dir "$(<"$STATE_ROOT/latest-run")")/report.txt"
+    fi
+}
+
+do_test_or_apply() {
+    local mode=$1 id dir lockfile target_ok=0 recovery=NOT-RUN timeout
+    require_root; require_commands; load_config "$CONFIG"
+    id=$(new_run "$mode"); dir=$(run_dir "$id")
+    mkdir -p "$dir"; chmod 700 "$dir"; RUN_DIR=$dir; log_setup "$dir/events.log"
+    lockfile=/run/pve-openwrt-edge.lock
+    exec 9>"$lockfile"; flock -n 9 || die 'another edge operation is already running'
+    note "${mode^^}: run $id"
+    source_preflight || die 'source topology preflight failed; no changes made'
+    backup_snapshot "$dir"
+    printf '%s\n' "$id" > "$STATE_ROOT/latest-$mode"; printf '%s\n' "$id" > "$STATE_ROOT/latest-run"; chmod 600 "$STATE_ROOT/latest-$mode" "$STATE_ROOT/latest-run"
+    set_state "$dir" SNAPSHOT
+    set_checkpoint "$dir" 'source snapshot complete'
+    ACTIVE_MODE=$mode
+    ACTIVE_RUN_DIR=$dir
+    RESTORE_DONE=0
+    trap emergency_restore EXIT INT TERM HUP
+    timeout=${ROLLBACK_AFTER:-$ROLLBACK_TIMEOUT}
+    arm_rollback "$id" "$timeout" || die 'independent rollback watchdog could not be armed'
+    set_state "$dir" APPLYING
+    set_checkpoint "$dir" 'rollback watchdog armed; target transition starting'
+    if ! transition_to_target "$dir"; then
+        note "${mode^^}: target application failed"
+        set_checkpoint "$dir" 'target transition failed; restoring source'
+        restore_snapshot "$dir" && recovery=PASS || recovery=FAILED
+        [[ $recovery == PASS ]] && { RESTORE_DONE=1; cancel_rollback "$id"; }
+        write_report "$dir" "$mode" FAILED "$recovery"
+        return 1
+    fi
+    set_state "$dir" TARGET_ACTIVE
+    set_checkpoint "$dir" 'target transition completed; diagnostics running'
+    collect_state TARGET
+    if target_preflight && observe_target; then target_ok=1; note "${mode^^}: target checks passed"; else note "${mode^^}: target checks failed"; fi
+    if [[ "$mode" == test ]]; then
+        note 'TEST: restoring exact source snapshot now'
+        set_checkpoint "$dir" 'target diagnostics complete; restoring source'
+        if restore_snapshot "$dir"; then recovery=PASS; RESTORE_DONE=1; cancel_rollback "$id"; else recovery=FAILED; fi
+        write_report "$dir" "$mode" "$([[ $target_ok -eq 1 ]] && printf PASS || printf FAILED)" "$recovery"
+        if [[ $recovery == PASS && $target_ok -eq 1 ]]; then
+            note 'TEST: PASS; target was exercised and source restored'
+            trap - EXIT INT TERM HUP
+            return 0
+        fi
+        die 'TEST: FAIL; target checks or source restoration checks failed; inspect log and provider console'
+    fi
+    if (( target_ok == 1 )); then
+        set_checkpoint "$dir" 'all target validation passed; keeping target topology'
+        set_state "$dir" CONFIRMED
+        cancel_rollback "$id"
+        RESTORE_DONE=1
+        write_report "$dir" "$mode" PASS NOT-RUN
+        note "APPLY: PASS; target topology is permanent. Manual rollback: $PROGRAM rollback --run $id"
+        return 0
+    fi
+    note 'APPLY: target validation failed; restoring source immediately'
+    set_checkpoint "$dir" 'target validation failed; restoring source'
+    restore_snapshot "$dir" && recovery=PASS || recovery=FAILED
+    [[ $recovery == PASS ]] && { RESTORE_DONE=1; cancel_rollback "$id"; }
+    write_report "$dir" "$mode" FAILED "$recovery"
+    return 1
+}
+
+do_rollback() {
+    require_root
+    if [[ -z "$RUN_ID" ]]; then
+        [[ -r "$STATE_ROOT/latest-apply" ]] || die 'no apply snapshot found; specify --run RUN_ID'
+        RUN_ID=$(<"$STATE_ROOT/latest-apply")
+    fi
+    valid_id "$RUN_ID" || die 'invalid run id'
+    local dir; dir=$(run_dir "$RUN_ID")
+    [[ -d "$dir" ]] || die "run not found: $RUN_ID"
+    CONFIG="$dir/config.conf"; load_config "$CONFIG"; RUN_DIR=$dir; log_setup "$dir/events.log"
+    cancel_rollback "$RUN_ID"
+    restore_snapshot "$dir" || die 'ROLLBACK: source restoration failed'
+    write_report "$dir" rollback NOT-RUN PASS
+    note 'ROLLBACK: PASS'
+}
+
+do_internal_restore() {
+    require_root; [[ -n "$RUN_ID" ]] || die 'internal restore needs --run RUN_ID'
+    valid_id "$RUN_ID" || die 'invalid run id'
+    local dir; dir=$(run_dir "$RUN_ID")
+    [[ -r "$dir/config.conf" ]] || die "snapshot not found: $RUN_ID"
+    CONFIG="$dir/config.conf"; load_config "$CONFIG"; RUN_DIR=$dir; log_setup "$dir/events.log"
+    note "AUTOMATIC ROLLBACK FIRED: $RUN_ID"
+    restore_snapshot "$dir" && write_report "$dir" watchdog UNKNOWN PASS || write_report "$dir" watchdog UNKNOWN FAILED
+}
+
+do_report() {
+    require_root
+    if ((REPORT_LAST == 1)); then
+        [[ -r "$STATE_ROOT/latest-run" ]] || die 'no prior run report exists'
+        RUN_ID=$(<"$STATE_ROOT/latest-run")
+    fi
+    [[ -n "$RUN_ID" ]] || die 'report requires --run RUN_ID or --last'
+    valid_id "$RUN_ID" || die 'invalid run id'
+    local file; file="$(run_dir "$RUN_ID")/report.txt"
+    [[ -r "$file" ]] || die "report not found: $file"
+    cat "$file"
+}
+
+case "$COMMAND" in
+    bootstrap) do_bootstrap ;;
+    doctor) do_doctor ;;
+    status) do_status ;;
+    report) do_report ;;
+    test) do_test_or_apply test ;;
+    apply) do_test_or_apply apply ;;
+    cancel) require_root; [[ -n "$RUN_ID" ]] || die 'cancel requires --run RUN_ID'; valid_id "$RUN_ID" || die 'invalid run id'; cancel_rollback "$RUN_ID" ;;
+    rollback) do_rollback ;;
+    internal-restore) do_internal_restore ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+esac

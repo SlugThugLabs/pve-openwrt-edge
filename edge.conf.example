@@ -1,0 +1,43 @@
+# pve-openwrt-edge configuration. Root-owned shell assignments.
+# Copy this to /etc/pve-openwrt-edge/edge.conf and adjust every value.
+
+CTID=100
+WAN_PHYS=eth0
+LAN_BRIDGE=vmbr0
+LAN_HOST_CIDR=10.77.0.2/24
+LAN_ROUTER_IP=10.77.0.1
+
+PUBLIC_CIDR=203.0.113.10/24
+PUBLIC_GATEWAY=203.0.113.1
+DNS_SERVERS=(1.1.1.1 9.9.9.9)
+
+# Device names inside OpenWrt and their corresponding LXC network indices.
+WAN_DEVICE=wan
+LAN_DEVICE=lan
+WAN_LXC_INDEX=0
+LAN_LXC_INDEX=1
+
+# Exact LAN-only /etc/network/interfaces to use after cutover.
+# It must leave WAN_PHYS manual and give Proxmox LAN_HOST_CIDR on LAN_BRIDGE,
+# with LAN_ROUTER_IP as its default gateway.
+TARGET_HOST_INTERFACES=/etc/pve-openwrt-edge/target-interfaces
+
+# Optional: checked after the cutover, but never created or modified.
+EXPECT_WG_INTERFACE=wg-proxmox
+
+# Initial OpenWrt CT creation. Pass a rootfs with `bootstrap --template ...`,
+# or set BOOTSTRAP_TEMPLATE here. It can be an absolute rootfs tarball or a
+# Proxmox template volume such as local:vztmpl/openwrt-...-rootfs.tar.gz.
+BOOTSTRAP_HOSTNAME=openwrt
+BOOTSTRAP_STORAGE=local-lvm
+BOOTSTRAP_DISK_SIZE=2
+BOOTSTRAP_CORES=1
+BOOTSTRAP_MEMORY=256
+BOOTSTRAP_SWAP=512
+BOOTSTRAP_STARTUP=order=1,up=30,down=60
+
+# Safety/diagnostic timing for real cutovers. Both test and apply arm the
+# independent rollback watchdog before changing networking.
+ROLLBACK_TIMEOUT=120
+OBSERVATION_SECONDS=25
+OBSERVATION_INTERVAL=5

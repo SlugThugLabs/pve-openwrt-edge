@@ -1,0 +1,11 @@
+# Server-specific configuration and local release artifacts
+edge.conf.this-server
+*.tar.gz
+*.tar.gz.sha256
+*.zip
+*.zip.sha256
+
+# Runtime/editor files
+*.log
+*.swp
+.DS_Store
