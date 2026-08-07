@@ -1,0 +1,14 @@
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+    address 10.77.0.2/24
+    gateway 10.77.0.1
+    dns-nameservers 10.77.0.1
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
