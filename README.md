@@ -57,7 +57,7 @@ Clone the repository and start the interactive wrapper:
 ```bash
 git clone https://github.com/nhogenson/pve-openwrt-edge.git
 cd pve-openwrt-edge
-sudo ./setup.sh
+sudo bash setup.sh
 ```
 
 `setup.sh` installs the current engine to `/usr/local/sbin/pve-openwrt-edge` and,
@@ -89,7 +89,7 @@ same migration, validation, and rollback implementation.
 
 ## Recommended workflow
 
-1. Run `sudo ./setup.sh`.
+1. Run `sudo bash setup.sh`.
 2. Edit `/etc/pve-openwrt-edge/edge.conf` and `target-interfaces` for the host.
 3. Bootstrap the LAN-only OpenWrt container if one does not already exist.
 4. Run **Doctor** until readiness checks pass.
