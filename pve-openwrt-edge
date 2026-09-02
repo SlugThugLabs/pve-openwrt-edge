@@ -60,7 +60,7 @@ load_config() {
     [[ -r "$file" ]] || die "configuration is not readable: $file"
     # The config is root-owned shell assignments, intentionally allowing DNS_SERVERS=(...).
     # Never use a config supplied by an untrusted user.
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090,SC1091
     source "$file"
     : "${CTID:?CTID is required}"
     : "${WAN_PHYS:?WAN_PHYS is required}"
@@ -119,7 +119,7 @@ set_state() {
 
 get_state() {
     local dir=$1
-    [[ -r "$(state_file "$dir")" ]] && <"$(state_file "$dir")" || printf 'UNKNOWN\n'
+    if [[ -r "$(state_file "$dir")" ]]; then cat "$(state_file "$dir")"; else printf 'UNKNOWN\n'; fi
 }
 
 netmask_for_prefix() {
@@ -368,7 +368,7 @@ emergency_restore() {
 restore_snapshot() {
     local dir=$1
     [[ -r "$dir/config.conf" ]] || die "snapshot is incomplete: $dir"
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090,SC1091
     source "$dir/config.conf"
     load_config "$dir/config.conf"
     local lock current
@@ -423,7 +423,7 @@ restore_snapshot() {
 
 arm_rollback() {
     local id=$1 seconds=$2 unit; unit=$(unit_name "$id")
-    [[ $seconds =~ ^[0-9]+$ ]] && ((seconds >= 15)) || die '--rollback-after must be at least 15 seconds'
+    if ! [[ $seconds =~ ^[0-9]+$ ]] || ((seconds < 15)); then die '--rollback-after must be at least 15 seconds'; fi
     systemd-run --quiet --unit="$unit" --on-active="${seconds}s" "$SELF" internal-restore --run "$id"
     note "FAILSAFE: rollback is armed for ${seconds}s (unit $unit.timer)"
 }
@@ -452,7 +452,7 @@ write_report() {
         printf '\nSOURCE RECOVERY: %s\n' "$recovery"
         awk -F '\t' '$1 == "ROLLBACK" { printf "  %-7s %s\n", $2, $3 }' "$dir/checks.tsv" 2>/dev/null || true
         printf '\nFINAL STATE: %s\n' "$(get_state "$dir")"
-        printf 'LAST CHECKPOINT: %s\n' "$(<"$dir/checkpoint" 2>/dev/null || printf unknown)"
+        printf 'LAST CHECKPOINT: %s\n' "$(cat "$dir/checkpoint" 2>/dev/null || printf unknown)"
         printf 'EVENT LOG: %s/events.log\n' "$dir"
     } > "$dir/report.txt"
     chmod 600 "$dir/report.txt"
@@ -578,7 +578,7 @@ do_doctor() {
     ((WAN_LXC_INDEX != LAN_LXC_INDEX)) || { note 'FAIL: WAN and LAN LXC indices must differ'; failed=1; }
     pct status "$CTID" || { note 'FAIL: CT is not known to Proxmox'; failed=1; }
     ip link show dev "$LAN_BRIDGE" >/dev/null 2>&1 || { note "FAIL: LAN bridge missing: $LAN_BRIDGE"; failed=1; }
-    mkdir -p "$STATE_ROOT/runs" && [[ -w "$STATE_ROOT/runs" ]] || { note "FAIL: state directory is not writable: $STATE_ROOT/runs"; failed=1; }
+    if ! mkdir -p "$STATE_ROOT/runs" || ! [[ -w "$STATE_ROOT/runs" ]]; then note "FAIL: state directory is not writable: $STATE_ROOT/runs"; failed=1; fi
     if ! pct exec "$CTID" -- sh -c 'command -v uci && command -v ip && command -v ping && command -v nslookup' >/dev/null 2>&1; then
         note 'FAIL: OpenWrt is missing one or more required commands (uci, ip, ping, nslookup)'; failed=1
     fi
@@ -627,6 +627,7 @@ do_test_or_apply() {
     printf '%s\n' "$id" > "$STATE_ROOT/latest-$mode"; printf '%s\n' "$id" > "$STATE_ROOT/latest-run"; chmod 600 "$STATE_ROOT/latest-$mode" "$STATE_ROOT/latest-run"
     set_state "$dir" SNAPSHOT
     set_checkpoint "$dir" 'source snapshot complete'
+    # shellcheck disable=SC2034 # operational state kept for postmortem inspection
     ACTIVE_MODE=$mode
     ACTIVE_RUN_DIR=$dir
     RESTORE_DONE=0
@@ -699,7 +700,11 @@ do_internal_restore() {
     [[ -r "$dir/config.conf" ]] || die "snapshot not found: $RUN_ID"
     CONFIG="$dir/config.conf"; load_config "$CONFIG"; RUN_DIR=$dir; log_setup "$dir/events.log"
     note "AUTOMATIC ROLLBACK FIRED: $RUN_ID"
-    restore_snapshot "$dir" && write_report "$dir" watchdog UNKNOWN PASS || write_report "$dir" watchdog UNKNOWN FAILED
+    if restore_snapshot "$dir"; then
+        write_report "$dir" watchdog UNKNOWN PASS
+    else
+        write_report "$dir" watchdog UNKNOWN FAILED
+    fi
 }
 
 do_report() {
